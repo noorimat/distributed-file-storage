@@ -2,7 +2,25 @@
   "373ff5ecc2c071967958e25f0a7cd4a35401395a1477a2a87bfe7d0c318fa6b7": {
     "hash": "373ff5ecc2c071967958e25f0a7cd4a35401395a1477a2a87bfe7d0c318fa6b7",
     "size": 130,
-    "ref_count": 2,
+    "ref_count": 4,
     "store_path": "storage/chunks/37/373ff5ecc2c071967958e25f0a7cd4a35401395a1477a2a87bfe7d0c318fa6b7"
+  },
+  "655ca69decd4931e79933532868628e63b9529aff778ffd95003ce5ccd0a3d50": {
+    "hash": "655ca69decd4931e79933532868628e63b9529aff778ffd95003ce5ccd0a3d50",
+    "size": 158,
+    "ref_count": 1,
+    "store_path": "storage/chunks/65/655ca69decd4931e79933532868628e63b9529aff778ffd95003ce5ccd0a3d50"
+  },
+  "7eba5054e69906ff7f884fc8a8d30545d71efb8bfb4caa425ed62c6bb5fd6065": {
+    "hash": "7eba5054e69906ff7f884fc8a8d30545d71efb8bfb4caa425ed62c6bb5fd6065",
+    "size": 130,
+    "ref_count": 2,
+    "store_path": "storage/chunks/7e/7eba5054e69906ff7f884fc8a8d30545d71efb8bfb4caa425ed62c6bb5fd6065"
+  },
+  "f7478fa8214dfaeaf933415ff3f6d3a33a5cbd76e91ae7d60c1437be99001284": {
+    "hash": "f7478fa8214dfaeaf933415ff3f6d3a33a5cbd76e91ae7d60c1437be99001284",
+    "size": 158,
+    "ref_count": 1,
+    "store_path": "storage/chunks/f7/f7478fa8214dfaeaf933415ff3f6d3a33a5cbd76e91ae7d60c1437be99001284"
   }
 }
