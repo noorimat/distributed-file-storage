@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,17 +15,21 @@ import (
 	"github.com/noorimat/distributed-file-storage/internal/crypto"
 	"github.com/noorimat/distributed-file-storage/internal/dedup"
 	"github.com/noorimat/distributed-file-storage/internal/metadata"
+	"github.com/noorimat/distributed-file-storage/internal/node"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 )
 
 const (
-	StoragePath = "./storage"
+	StoragePath      = "./storage"
+	ReplicationCount = 3 // Store each chunk on 3 nodes
 )
 
 // Global instances
 var chunkStore *dedup.ChunkStore
 var db *metadata.Database
+var nodeRegistry *node.Registry
+var consistentHash *node.ConsistentHash
 
 type UploadResponse struct {
 	FileID       string   `json:"file_id"`
@@ -52,35 +57,48 @@ func main() {
 	defer db.Close()
 	log.Printf("Connected to PostgreSQL database")
 
-	// Initialize chunk store for deduplication
+	// Initialize chunk store for local deduplication (fallback)
 	chunkStore, err = dedup.NewChunkStore(StoragePath)
 	if err != nil {
 		log.Fatal("Failed to initialize chunk store:", err)
 	}
 
+	// Initialize node registry and consistent hashing
+	nodeRegistry = node.NewRegistry(30 * time.Second)
+	consistentHash = node.NewConsistentHash()
+	log.Printf("Initialized node registry and consistent hashing")
+
 	router := mux.NewRouter()
 
-	// Routes
+	// Existing routes
 	router.HandleFunc("/health", healthHandler).Methods("GET")
 	router.HandleFunc("/upload", uploadHandler).Methods("POST")
 	router.HandleFunc("/download/{fileID}", downloadHandler).Methods("GET")
 	router.HandleFunc("/files", listFilesHandler).Methods("GET")
 	router.HandleFunc("/stats", statsHandler).Methods("GET")
 
+	// New routes for node coordination
+	router.HandleFunc("/register", registerNodeHandler).Methods("POST")
+	router.HandleFunc("/heartbeat", heartbeatHandler).Methods("POST")
+	router.HandleFunc("/nodes", listNodesHandler).Methods("GET")
+
 	// Start server
 	port := ":8080"
-	log.Printf("API Server starting on http://localhost%s", port)
+	log.Printf("API Server (Coordinator) starting on http://localhost%s", port)
 	log.Printf("Storage path: %s", StoragePath)
-	log.Printf("Content-defined chunking + deduplication + encryption + PostgreSQL ENABLED")
+	log.Printf("Multi-node distribution + PostgreSQL + encryption ENABLED")
 	log.Fatal(http.ListenAndServe(port, router))
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
+	healthyNodes := nodeRegistry.GetHealthyNodes()
+	
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":   "healthy",
-		"time":     time.Now().Format(time.RFC3339),
-		"database": "connected",
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":        "healthy",
+		"time":          time.Now().Format(time.RFC3339),
+		"database":      "connected",
+		"storage_nodes": len(healthyNodes),
 	})
 }
 
@@ -132,6 +150,16 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Created %d content-defined chunks", len(chunks))
 
+	// Get healthy nodes
+	healthyNodes := nodeRegistry.GetHealthyNodes()
+	useDistribution := len(healthyNodes) > 0
+
+	if useDistribution {
+		log.Printf("Distributing chunks across %d nodes", len(healthyNodes))
+	} else {
+		log.Printf("No storage nodes available, storing locally")
+	}
+
 	// Store chunks with deduplication and encryption
 	chunkHashes := []string{}
 	newChunksStored := 0
@@ -154,8 +182,31 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 			chunk.Hash = hex.EncodeToString(hash[:])
 		}
 
-		// Store chunk physically
-		storagePath, isNew, err := chunkStore.StoreChunk(chunk.Hash, chunkData)
+		var storagePath string
+		var isNew bool
+
+		if useDistribution {
+			// Distribute to nodes using consistent hashing
+			targetNodes, err := consistentHash.GetNodes(chunk.Hash, ReplicationCount)
+			if err != nil {
+				log.Printf("Failed to get target nodes: %v", err)
+				// Fallback to local storage
+				storagePath, isNew, err = chunkStore.StoreChunk(chunk.Hash, chunkData)
+			} else {
+				isNew, err = distributeChunkToNodes(chunk.Hash, chunkData, targetNodes)
+				if err != nil {
+					log.Printf("Failed to distribute chunk: %v", err)
+					// Fallback to local storage
+					storagePath, isNew, err = chunkStore.StoreChunk(chunk.Hash, chunkData)
+				} else {
+					storagePath = fmt.Sprintf("distributed:%s", targetNodes[0])
+				}
+			}
+		} else {
+			// Store locally
+			storagePath, isNew, err = chunkStore.StoreChunk(chunk.Hash, chunkData)
+		}
+
 		if err != nil {
 			http.Error(w, "Failed to store chunk", http.StatusInternalServerError)
 			log.Printf("Failed to store chunk %d: %v", i, err)
@@ -268,11 +319,16 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Stream chunks
 	for i, hash := range chunkHashes {
-		chunkData, err := chunkStore.GetChunk(hash)
+		// Try to get from distributed nodes first
+		chunkData, err := retrieveChunkFromNodes(hash)
 		if err != nil {
-			log.Printf("Failed to retrieve chunk %d (hash: %s): %v", i, hash[:8], err)
-			http.Error(w, "Failed to retrieve chunk", http.StatusInternalServerError)
-			return
+			// Fallback to local storage
+			chunkData, err = chunkStore.GetChunk(hash)
+			if err != nil {
+				log.Printf("Failed to retrieve chunk %d (hash: %s): %v", i, hash[:8], err)
+				http.Error(w, "Failed to retrieve chunk", http.StatusInternalServerError)
+				return
+			}
 		}
 
 		// Decrypt if needed
@@ -320,6 +376,136 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
+}
+
+// registerNodeHandler handles storage node registration
+func registerNodeHandler(w http.ResponseWriter, r *http.Request) {
+	var nodeInfo node.NodeInfo
+	if err := json.NewDecoder(r.Body).Decode(&nodeInfo); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	if err := nodeRegistry.RegisterNode(nodeInfo.NodeID, nodeInfo.Address); err != nil {
+		http.Error(w, "Failed to register node", http.StatusInternalServerError)
+		return
+	}
+
+	// Add to consistent hash ring
+	consistentHash.AddNode(nodeInfo.NodeID)
+
+	log.Printf("Registered storage node: %s at %s", nodeInfo.NodeID, nodeInfo.Address)
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "registered",
+		"node_id": nodeInfo.NodeID,
+	})
+}
+
+// heartbeatHandler handles heartbeat messages from storage nodes
+func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
+	var heartbeat node.HeartbeatMessage
+	if err := json.NewDecoder(r.Body).Decode(&heartbeat); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	if err := nodeRegistry.UpdateHeartbeat(heartbeat.NodeID, heartbeat.TotalChunks, heartbeat.Used); err != nil {
+		http.Error(w, "Failed to update heartbeat", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// listNodesHandler returns all registered nodes
+func listNodesHandler(w http.ResponseWriter, r *http.Request) {
+	nodes := nodeRegistry.GetAllNodes()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"count": len(nodes),
+		"nodes": nodes,
+	})
+}
+
+// distributeChunkToNodes sends a chunk to multiple storage nodes for replication
+func distributeChunkToNodes(chunkHash string, chunkData []byte, nodeIDs []string) (bool, error) {
+	isNew := false
+
+	for _, nodeID := range nodeIDs {
+		nodeInfo, err := nodeRegistry.GetNode(nodeID)
+		if err != nil {
+			log.Printf("Failed to get node %s: %v", nodeID, err)
+			continue
+		}
+
+		// Send chunk to node
+		url := fmt.Sprintf("http://%s/store", nodeInfo.Address)
+		
+		storeReq := node.StoreChunkRequest{
+			ChunkHash: chunkHash,
+			ChunkData: chunkData,
+		}
+
+		reqBody, _ := json.Marshal(storeReq)
+		resp, err := http.Post(url, "application/json", bytes.NewReader(reqBody))
+		if err != nil {
+			log.Printf("Failed to store chunk on node %s: %v", nodeID, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		var storeResp node.StoreChunkResponse
+		if err := json.NewDecoder(resp.Body).Decode(&storeResp); err != nil {
+			log.Printf("Failed to decode response from node %s: %v", nodeID, err)
+			continue
+		}
+
+		if storeResp.Success {
+			log.Printf("Stored chunk %s on node %s", chunkHash[:8], nodeID)
+			isNew = true
+		}
+	}
+
+	return isNew, nil
+}
+
+// retrieveChunkFromNodes attempts to retrieve a chunk from storage nodes
+func retrieveChunkFromNodes(chunkHash string) ([]byte, error) {
+	targetNodes, err := consistentHash.GetNodes(chunkHash, ReplicationCount)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, nodeID := range targetNodes {
+		nodeInfo, err := nodeRegistry.GetNode(nodeID)
+		if err != nil {
+			continue
+		}
+
+		url := fmt.Sprintf("http://%s/retrieve/%s", nodeInfo.Address, chunkHash)
+		resp, err := http.Get(url)
+		if err != nil {
+			log.Printf("Failed to retrieve from node %s: %v", nodeID, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			var retrieveResp node.RetrieveChunkResponse
+			if err := json.NewDecoder(resp.Body).Decode(&retrieveResp); err != nil {
+				continue
+			}
+
+			if retrieveResp.Success {
+				return retrieveResp.ChunkData, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("chunk not found on any node")
 }
 
 func getEnv(key, fallback string) string {
