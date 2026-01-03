@@ -462,7 +462,7 @@ This is an educational project demonstrating distributed systems concepts. While
 
 **Noor Imat**  
 Computer Science Student, University of Virginia  
-[GitHub](https://github.com/noorimat) | [LinkedIn](www.linkedin.com/in/noor-imat-74094534a)
+[GitHub](https://github.com/noorimat) | [LinkedIn](https://www.linkedin.com/in/noor-imat-74094534a)
 
 ## License
 
