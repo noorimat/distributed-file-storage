@@ -17,18 +17,18 @@ A distributed file storage system I built in Go. You upload a file, it gets spli
 
 ### Upload path
 
-1. The file is split into chunks using content-defined chunking (Rabin fingerprinting), with chunk sizes between 2 and 8 MB.
+1. The file is split into chunks using content-defined chunking with a rolling hash, with chunk sizes between 2 and 8 MB.
 2. Each chunk is hashed with SHA-256. If that hash already exists, the chunk isn't stored again and its reference count goes up.
 3. If a password is given, the file is encrypted with AES-256-GCM (key derived with PBKDF2, unique salt per file) before it's stored.
 4. Consistent hashing (150 virtual nodes per physical node) picks a primary node and 2 replicas, and the chunk is written to all 3.
 
 ### Download path
 
-The coordinator looks up the file's chunks in PostgreSQL and fetches each one from any healthy replica. If a node misses heartbeats for 30 seconds, it's marked down and reads go to the other replicas.
+The coordinator looks up the file's chunks in PostgreSQL and fetches each one from any healthy replica. If a node is down, the download tries the chunk's next replica. Nodes send heartbeats, and any node silent for 30 seconds shows as offline.
 
 ## Why I made these choices
 
-- **Content-defined chunking instead of fixed-size:** with fixed-size chunks, inserting a few bytes at the start of a file shifts every chunk after it, so nothing dedupes. Rabin fingerprinting picks boundaries based on the content itself, so an edit only changes the chunks around it.
+- **Content-defined chunking instead of fixed-size:** with fixed-size chunks, inserting a few bytes at the start of a file shifts every chunk after it, so nothing dedupes. A rolling hash picks boundaries based on the content itself, so an edit only changes the chunks around it.
 - **Consistent hashing instead of `hash % N`:** with `hash % N`, adding or removing a node remaps almost every chunk. With a hash ring, only the chunks near that node move.
 - **3x replication instead of erasure coding:** much simpler to build and any single replica can serve a read. Erasure coding would use less space but needs reconstruction logic I didn't want to take on yet.
 - **PostgreSQL for metadata:** I started with JSON files, but needed transactions and indexed lookups once multiple uploads were running at the same time.
@@ -109,8 +109,6 @@ I ran everything locally with 3 nodes and tested:
 - stopping a node mid-download and confirming the file still came back from a replica
 - restarting the coordinator and checking that metadata persisted
 
-In my testing, dedup cut storage by about 2-4x on files that shared content.
-
 ## What was hard
 
 At first, the storage nodes would write their chunks directly into the project directory, and I had committed a lot of them by mistake. I decided to give each node its own storage directory and ignore them in git, which also made it easy to wipe a node's data when testing failover.
@@ -123,6 +121,7 @@ At first, the storage nodes would write their chunks directly into the project d
 - No authentication on the API.
 - Encryption happens on the coordinator, so the password is sent to the server. It's not end-to-end.
 - Only tested with all nodes on one machine.
+- Encrypted uploads aren't deduplicated, since each chunk is encrypted with a random nonce.
 
 ## What I'd add next
 
