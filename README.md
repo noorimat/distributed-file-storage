@@ -113,7 +113,7 @@ In my testing, dedup cut storage by about 2-4x on files that shared content.
 
 ## What was hard
 
-<!-- Write 2-3 sentences in your own words: a bug that took you a while, something that surprised you, or what you'd do differently. -->
+At first, the storage nodes would write their chunks directly into the project directory, and I had committed a lot of them by mistake. I decided to give each node its own storage directory and ignore them in git, which also made it easy to wipe a node's data when testing failover.
 
 ## Limitations
 
